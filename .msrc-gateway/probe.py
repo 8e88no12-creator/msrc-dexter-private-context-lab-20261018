@@ -368,6 +368,26 @@ def verify_null_logs(logs):
                for name in NULL_LOG_NAMES)
 
 
+def scan_private_scratch(logs, comment):
+    # Gateway container runs as root. Its ordinary scratch files can be 0600.
+    # Stop it first, then make only this ephemeral runner directory readable.
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
+    if (not runner_temp.is_dir() or not logs.resolve().is_relative_to(runner_temp)
+            or not logs.name.startswith("msrc-gateway-null-")):
+        raise ProbeError("scratch_log_path_invalid")
+    owner = f"{os.getuid()}:{os.getgid()}"
+    changed = subprocess.run(["sudo", "-n", "chown", "-hR", owner, str(logs)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             timeout=20, check=False)
+    if changed.returncode:
+        raise ProbeError("scratch_log_access_failed")
+    try:
+        return any(comment.encode() in path.read_bytes()
+                   for path in logs.rglob("*") if path.is_file() and not path.is_symlink())
+    except OSError:
+        raise ProbeError("scratch_log_access_failed") from None
+
+
 def run():
     global CURRENT_STAGE
     repository = os.environ.get("GITHUB_REPOSITORY", "")
@@ -462,16 +482,14 @@ def run():
                 list_category, list_hash_match = classify_read(list_response, expected)
                 if not verify_null_logs(logs):
                     raise ProbeError("null_log_guard_after_read_failed")
-                # Scan only regular scratch files. Symlinks point to /dev/null;
-                # no log or full response is copied to Actions output/artifacts.
-                scratch_contains_comment = any(
-                    comment.encode() in path.read_bytes()
-                    for path in logs.rglob("*") if path.is_file() and not path.is_symlink()
-                )
-                if scratch_contains_comment:
-                    raise ProbeError("private_comment_in_scratch_log")
             finally:
                 stop_gateway(process, name)
+            CURRENT_STAGE = "scratch_log_scan"
+            if not verify_null_logs(logs):
+                raise ProbeError("null_log_guard_after_stop_failed")
+            # No full response or gateway log is copied to Actions output.
+            if scan_private_scratch(logs, comment):
+                raise ProbeError("private_comment_in_scratch_log")
     finally:
         sink.shutdown()
 
