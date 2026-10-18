@@ -1,0 +1,9 @@
+{
+  "name": "msrc-dexter-private-context-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated security research fixture. Not deployed or executed.",
+  "dependencies": {
+    "lodash": "4.17.20"
+  }
+}
