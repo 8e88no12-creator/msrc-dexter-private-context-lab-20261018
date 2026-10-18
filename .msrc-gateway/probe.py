@@ -454,6 +454,23 @@ def run():
     if not isinstance(comment, str) or hashlib.sha256(comment.encode()).hexdigest() != expected:
         raise ProbeError("alert_hash_preflight_failed")
 
+    CURRENT_STAGE = "list_alert_preflight"
+    direct_list_status, direct_list_data = api_get(
+        f"https://api.github.com/repos/{repository}/dependabot/alerts?state=dismissed&per_page=100",
+        token)
+    if direct_list_status != 200 or not isinstance(direct_list_data, list):
+        raise ProbeError("list_alert_preflight_failed")
+    direct_list_item_count = len(direct_list_data)
+    direct_list_matches = [item for item in direct_list_data
+                           if isinstance(item, dict) and item.get("number") == ALERT_NUMBER]
+    if len(direct_list_matches) != 1:
+        raise ProbeError("list_alert_5_missing_or_duplicate")
+    direct_list_comment = direct_list_matches[0].get("dismissed_comment")
+    if (not isinstance(direct_list_comment, str) or
+            hashlib.sha256(direct_list_comment.encode()).hexdigest() != expected):
+        raise ProbeError("list_alert_hash_preflight_failed")
+    del direct_list_data, direct_list_matches, direct_list_comment
+
     CURRENT_STAGE = "gateway_image_pull"
     pull_and_verify(GATEWAY_IMAGE)
     CURRENT_STAGE = "github_mcp_image_pull"
@@ -548,6 +565,10 @@ def run():
         "repo_visibility": visibility,
         "alert_http": alert_status,
         "direct_alert_hash_match": True,
+        "direct_list_http": direct_list_status,
+        "direct_list_item_count": direct_list_item_count,
+        "direct_list_alert_5_present": True,
+        "direct_list_comment_hash_match": True,
         "gateway_wasm_loaded": markers["wasm_guard_loaded"],
         "startup_instance_force_public_repos": markers["force_public_repos"],
         "public_sink_guard_configured": markers["public_sink_guard"],
