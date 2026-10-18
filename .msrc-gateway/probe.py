@@ -356,11 +356,51 @@ def classify_read(response, expected_hash):
                    for value in find_comments(response))
     if matching:
         return "returned_matching_private_comment", True
-    if "[Filtered]" in response.get("error", {}).get("message", ""):
+    if "[Filtered]" in json.dumps(response, ensure_ascii=False):
         return "filtered_by_gateway", False
     if "error" in response:
         return "other_gateway_error", False
     return "returned_without_matching_comment", False
+
+
+def iter_decoded_nodes(obj, depth=0):
+    if depth > 12:
+        return
+    yield obj
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield from iter_decoded_nodes(value, depth + 1)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from iter_decoded_nodes(value, depth + 1)
+    elif isinstance(obj, str) and obj.lstrip()[:1] in ("{", "["):
+        try:
+            decoded = json.loads(obj)
+        except ValueError:
+            return
+        yield from iter_decoded_nodes(decoded, depth + 1)
+
+
+def summarize_list_shape(response):
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    content = result.get("content") if isinstance(result.get("content"), list) else []
+    dictionaries = [node for node in iter_decoded_nodes(response) if isinstance(node, dict)]
+    numbers = ("number", "alertNumber", "alert_number")
+    return {
+        "jsonrpc_has_result": "result" in response,
+        "jsonrpc_has_error": "error" in response,
+        "mcp_is_error": result.get("isError") if isinstance(result.get("isError"), bool) else None,
+        "content_item_count": len(content),
+        "content_text_count": sum(isinstance(item, dict) and item.get("type") == "text" for item in content),
+        "alert_number_5_present": any(any(item.get(key) == ALERT_NUMBER for key in numbers)
+                                      for item in dictionaries),
+        "dismissed_comment_field_present": any("dismissed_comment" in item for item in dictionaries),
+        "dismissed_comment_string_count": sum(isinstance(item.get("dismissed_comment"), str)
+                                               for item in dictionaries),
+        "filtered_marker_present": "[Filtered]" in json.dumps(response, ensure_ascii=False),
+        "alerts_array_item_count": sum(len(item["alerts"]) for item in dictionaries
+                                       if isinstance(item.get("alerts"), list)),
+    }
 
 
 def verify_null_logs(logs):
@@ -480,6 +520,7 @@ def run():
                         "state": "dismissed",
                     }}, 4)
                 list_category, list_hash_match = classify_read(list_response, expected)
+                list_shape = summarize_list_shape(list_response)
                 if not verify_null_logs(logs):
                     raise ProbeError("null_log_guard_after_read_failed")
             finally:
@@ -516,6 +557,7 @@ def run():
         "gateway_list_http": list_http,
         "gateway_list_category": list_category,
         "gateway_list_comment_hash_match": list_hash_match,
+        "gateway_list_shape": list_shape,
         "mock_sink_tool_calls": NoopSink.tool_calls,
         "no_artifact_upload_step": True,
     }
