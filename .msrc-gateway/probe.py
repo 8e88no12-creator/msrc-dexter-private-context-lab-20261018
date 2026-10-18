@@ -34,6 +34,7 @@ NULL_LOG_NAMES = (
     "mcp-gateway.log", "rpc-messages.jsonl", "gateway.md",
     "github.log", "safeoutputs.log",
 )
+CURRENT_STAGE = "entry"
 
 
 class ProbeError(Exception):
@@ -55,13 +56,16 @@ def api_get(url, token):
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "msrc-owned-lab-gateway-probe",
     })
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return response.status, json.load(response)
-    except urllib.error.HTTPError as exc:
-        return exc.code, None
-    except (urllib.error.URLError, ValueError):
-        return 0, None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except (urllib.error.URLError, ValueError, OSError):
+            if attempt < 2:
+                time.sleep(0.5)
+    return 0, None
 
 
 def pull_and_verify(image):
@@ -196,7 +200,7 @@ def start_gateway(repository, token, sink_port, logs, label):
             with urllib.request.urlopen(f"http://127.0.0.1:{host_port}/health", timeout=2) as response:
                 if response.status == 200:
                     return process, name, host_port, agent_id
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, OSError):
             time.sleep(0.4)
     stop_gateway(process, name)
     raise ProbeError("gateway_health_timeout")
@@ -263,7 +267,7 @@ def rpc(host_port, agent_id, session, method, params=None, request_id=None):
             return exc.code, session, parse_rpc(exc.read())
         except ValueError:
             return exc.code, session, {}
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         raise ProbeError("gateway_rpc_transport_failed") from None
 
 
@@ -303,6 +307,7 @@ def verify_null_logs(logs):
 
 
 def run():
+    global CURRENT_STAGE
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     token = os.environ.get("GH_TOKEN", "")
     expected = os.environ.get("EXPECTED_SHA256", "").lower()
@@ -311,12 +316,14 @@ def run():
     if not token or len(expected) != 64:
         raise ProbeError("missing_auth_or_expected_hash")
 
+    CURRENT_STAGE = "repo_visibility_preflight"
     repo_status, repo_data = api_get(f"https://api.github.com/repos/{repository}", token)
     if repo_status != 200 or not isinstance(repo_data, dict):
         raise ProbeError("repo_visibility_preflight_failed")
     visibility = repo_data.get("visibility")
     if visibility != "public" or repo_data.get("private") is not False:
         raise ProbeError("repo_visibility_not_public")
+    CURRENT_STAGE = "alert_preflight"
     alert_status, alert_data = api_get(
         f"https://api.github.com/repos/{repository}/dependabot/alerts/{ALERT_NUMBER}", token)
     if alert_status != 200 or not isinstance(alert_data, dict):
@@ -325,7 +332,9 @@ def run():
     if not isinstance(comment, str) or hashlib.sha256(comment.encode()).hexdigest() != expected:
         raise ProbeError("alert_hash_preflight_failed")
 
+    CURRENT_STAGE = "gateway_image_pull"
     pull_and_verify(GATEWAY_IMAGE)
+    CURRENT_STAGE = "github_mcp_image_pull"
     pull_and_verify(GITHUB_MCP_IMAGE)
 
     sink = ThreadingHTTPServer(("0.0.0.0", port()), NoopSink)
@@ -334,6 +343,7 @@ def run():
     try:
         # Startup-only instance provides direct effective-policy markers before
         # any private alert call. Its logs remain runner-private and are deleted.
+        CURRENT_STAGE = "startup_gateway"
         with tempfile.TemporaryDirectory(prefix="msrc-gateway-startup-", dir=os.environ.get("RUNNER_TEMP")) as directory:
             logs = Path(directory)
             process, name, _, _ = start_gateway(repository, token, sink_port, logs, "startup")
@@ -347,6 +357,7 @@ def run():
             raise ProbeError("visibility_lookup_failed_open")
 
         # Sensitive instance: every content-bearing gateway log is /dev/null.
+        CURRENT_STAGE = "read_gateway"
         with tempfile.TemporaryDirectory(prefix="msrc-gateway-null-", dir=os.environ.get("RUNNER_TEMP")) as directory:
             logs = Path(directory)
             for filename in NULL_LOG_NAMES:
@@ -355,18 +366,21 @@ def run():
             try:
                 if not verify_null_logs(logs):
                     raise ProbeError("null_log_guard_before_read_failed")
+                CURRENT_STAGE = "read_gateway_initialize"
                 status, session, initialized = rpc(host_port, agent_id, None, "initialize",
                     {"protocolVersion": "2024-11-05", "capabilities": {},
                      "clientInfo": {"name": "owned-lab-read-probe", "version": "1.0"}}, 1)
                 if status != 200 or "result" not in initialized:
                     raise ProbeError("gateway_initialize_failed")
                 rpc(host_port, agent_id, session, "notifications/initialized")
+                CURRENT_STAGE = "read_gateway_tools_list"
                 _, session, listed = rpc(host_port, agent_id, session, "tools/list", {}, 2)
                 names = [tool.get("name", "") for tool in listed.get("result", {}).get("tools", [])]
                 get_tool = next((name for name in names if name.endswith("get_dependabot_alert")), None)
                 list_tool = next((name for name in names if name.endswith("list_dependabot_alerts")), None)
                 if get_tool is None or list_tool is None:
                     raise ProbeError("dependabot_tools_missing")
+                CURRENT_STAGE = "read_gateway_get_alert"
                 get_http, session, get_response = rpc(host_port, agent_id, session, "tools/call",
                     {"name": get_tool, "arguments": {
                         "owner": repository.split("/", 1)[0],
@@ -374,6 +388,7 @@ def run():
                         "alertNumber": ALERT_NUMBER,
                     }}, 3)
                 get_category, get_hash_match = classify_read(get_response, expected)
+                CURRENT_STAGE = "read_gateway_list_alerts"
                 list_http, session, list_response = rpc(host_port, agent_id, session, "tools/call",
                     {"name": list_tool, "arguments": {
                         "owner": repository.split("/", 1)[0],
@@ -430,5 +445,6 @@ if __name__ == "__main__":
     except Exception as exc:
         # Never print exception values: HTTP, Docker, or MCP errors may contain
         # credential-bearing headers or the private alert response.
-        print("MSRC_GATEWAY_READ_FAILURE unexpected_" + type(exc).__name__, flush=True)
+        print("MSRC_GATEWAY_READ_FAILURE unexpected_" + type(exc).__name__ +
+              "_at_" + CURRENT_STAGE, flush=True)
         sys.exit(1)
