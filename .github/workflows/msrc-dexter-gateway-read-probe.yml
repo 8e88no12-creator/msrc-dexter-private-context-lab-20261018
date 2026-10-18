@@ -1,0 +1,28 @@
+name: MSRC Dexter pinned gateway private-alert read probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  vulnerability-alerts: read
+  security-events: read
+
+jobs:
+  gateway-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout trusted default-branch probe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Execute hash-only gateway read probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: ${{ vars.MSRC_ALERT_CANARY_SHA256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          python3 .msrc-gateway/probe.py

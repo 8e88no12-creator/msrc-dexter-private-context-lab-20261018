@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""Owned-lab, hash-only Dexter gateway read probe.
+
+This runs the exact pinned gateway and GitHub MCP server images. It never
+prints, writes, or uploads the dismissed_comment or an MCP tool response.
+"""
+
+import hashlib
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+GATEWAY_IMAGE = (
+    "ghcr.io/github/gh-aw-mcpg:v0.4.25@"
+    "sha256:9be0a86220e807a0ecc89e53d7453468f7a53fbc6b3d1efd2299025ffe01d086"
+)
+GITHUB_MCP_IMAGE = (
+    "ghcr.io/github/github-mcp-server:v1.12.2@"
+    "sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6"
+)
+ALERT_NUMBER = 5
+NULL_LOG_NAMES = (
+    "mcp-gateway.log", "rpc-messages.jsonl", "gateway.md",
+    "github.log", "safeoutputs.log",
+)
+
+
+class ProbeError(Exception):
+    def __init__(self, category):
+        super().__init__(category)
+        self.category = category
+
+
+def port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def api_get(url, token):
+    request = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "msrc-owned-lab-gateway-probe",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (urllib.error.URLError, ValueError):
+        return 0, None
+
+
+def pull_and_verify(image):
+    done = subprocess.run(["docker", "pull", image], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=240, check=False)
+    if done.returncode:
+        raise ProbeError("image_pull_failed")
+    inspect = subprocess.run(["docker", "image", "inspect", "--format",
+                              "{{json .RepoDigests}}", image], capture_output=True,
+                             text=True, timeout=20, check=False)
+    if inspect.returncode:
+        raise ProbeError("image_inspect_failed")
+    try:
+        digests = json.loads(inspect.stdout)
+    except ValueError:
+        raise ProbeError("image_inspect_invalid") from None
+    expected = image.split("@", 1)[1]
+    if not any(item.endswith("@" + expected) for item in digests):
+        raise ProbeError("image_digest_mismatch")
+
+
+class NoopSink(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    tool_calls = 0
+
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        try:
+            request = json.loads(self.rfile.read(size) or b"{}")
+        except ValueError:
+            self.reply(400, {"error": "invalid_json"})
+            return
+        method = request.get("method")
+        if method == "notifications/initialized":
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if method == "initialize":
+            result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "owned-lab-noop-sink", "version": "1.0"}}
+        elif method in ("tools/list", "server/discover"):
+            result = {"tools": []}
+        elif method == "tools/call":
+            type(self).tool_calls += 1
+            self.reply(200, {"jsonrpc": "2.0", "id": request.get("id"),
+                             "error": {"code": -32601, "message": "no_tools"}})
+            return
+        else:
+            self.reply(200, {"jsonrpc": "2.0", "id": request.get("id"),
+                             "error": {"code": -32601, "message": "no_method"}})
+            return
+        self.reply(200, {"jsonrpc": "2.0", "id": request.get("id"), "result": result})
+
+    def reply(self, status, data):
+        body = json.dumps(data, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def config(agent_id, sink_port):
+    return {
+        "mcpServers": {
+            "github": {
+                "type": "stdio", "container": GITHUB_MCP_IMAGE,
+                "env": {
+                    "GITHUB_FEATURES": "fields_param",
+                    "GITHUB_HOST": "${GITHUB_SERVER_URL}",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}",
+                    "GITHUB_READ_ONLY": "1",
+                    "GITHUB_TOOLSETS": "context,repos,pull_requests,actions,dependabot",
+                },
+                "guard-policies": {"allow-only": {
+                    "approval-labels": [], "blocked-users": [],
+                    "min-integrity": "unapproved", "repos": "all",
+                    "trusted-users": [],
+                }},
+            },
+            "safeoutputs": {
+                "type": "http",
+                "url": f"http://host.docker.internal:{sink_port}/safeoutputs",
+                "guard-policies": {"write-sink": {
+                    "accept": ["*"], "sink-visibility": "public",
+                }},
+            },
+        },
+        "gateway": {"port": 3000, "domain": "localhost", "agentId": agent_id},
+    }
+
+
+def start_gateway(repository, token, sink_port, logs, label):
+    host_port = port()
+    agent_id = secrets.token_urlsafe(30)
+    name = f"msrc-dexter-probe-{label}-{os.getpid()}"
+    env = os.environ.copy()
+    env["GITHUB_TOKEN"] = token
+    env["GITHUB_REPOSITORY"] = repository
+    env["GITHUB_SERVER_URL"] = "https://github.com"
+    command = [
+        "docker", "run", "--rm", "-i", "--name", name,
+        "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
+        "-p", f"127.0.0.1:{host_port}:3000",
+        "-v", "/var/run/docker.sock:/var/run/docker.sock",
+        "-v", f"{logs}:/tmp/gh-aw/mcp-logs:rw",
+        "-e", "GITHUB_TOKEN", "-e", "GITHUB_REPOSITORY", "-e", "GITHUB_SERVER_URL",
+        "-e", "MCP_GATEWAY_PORT=3000", "-e", "MCP_GATEWAY_DOMAIN=localhost",
+        "-e", f"MCP_GATEWAY_AGENT_ID={agent_id}",
+        "-e", "MCP_GATEWAY_MODE=--unified",
+        "-e", "MCP_GATEWAY_LOG_DIR=/tmp/gh-aw/mcp-logs",
+        GATEWAY_IMAGE, "--payload-size-threshold", "104857600",
+    ]
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        process.stdin.write(json.dumps(config(agent_id, sink_port)).encode())
+        process.stdin.close()
+    except (BrokenPipeError, OSError):
+        stop_gateway(process, name)
+        raise ProbeError("gateway_config_pipe_failed") from None
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stop_gateway(process, name)
+            raise ProbeError("gateway_exited_before_health")
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{host_port}/health", timeout=2) as response:
+                if response.status == 200:
+                    return process, name, host_port, agent_id
+        except (urllib.error.URLError, TimeoutError):
+            time.sleep(0.4)
+    stop_gateway(process, name)
+    raise ProbeError("gateway_health_timeout")
+
+
+def stop_gateway(process, name):
+    subprocess.run(["docker", "stop", "--time", "2", name],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=12, check=False)
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def startup_markers(logs):
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        text = "\n".join(
+            (logs / name).read_text(errors="replace")
+            for name in ("mcp-gateway.log", "github.log", "safeoutputs.log")
+            if (logs / name).exists()
+        )
+        markers = {
+            "wasm_guard_loaded": "Loaded discovered WASM guard from file" in text,
+            "force_public_repos": "FORCED REPOS=PUBLIC" in text,
+            "force_public_fail_open": "fail-open, not forcing repos=public" in text,
+            "public_sink_guard": 'Created write-sink guard with 1 accept patterns, sink-visibility="public"' in text,
+        }
+        if markers["wasm_guard_loaded"] and markers["force_public_repos"] and markers["public_sink_guard"]:
+            return markers
+        time.sleep(0.3)
+    return markers
+
+
+def parse_rpc(body):
+    text = body.decode(errors="replace")
+    if "data:" in text:
+        lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+        if lines:
+            return json.loads(lines[-1])
+    return json.loads(text)
+
+
+def rpc(host_port, agent_id, session, method, params=None, request_id=None):
+    obj = {"jsonrpc": "2.0", "method": method}
+    if request_id is not None:
+        obj["id"] = request_id
+    if params is not None:
+        obj["params"] = params
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream",
+               "Authorization": agent_id}
+    if session:
+        headers["Mcp-Session-Id"] = session
+    request = urllib.request.Request(f"http://127.0.0.1:{host_port}/mcp",
+                                     data=json.dumps(obj).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            return response.status, response.headers.get("Mcp-Session-Id", session), parse_rpc(response.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, session, parse_rpc(exc.read())
+        except ValueError:
+            return exc.code, session, {}
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise ProbeError("gateway_rpc_transport_failed") from None
+
+
+def find_comments(obj, depth=0):
+    if depth > 10:
+        return []
+    if isinstance(obj, dict):
+        values = [obj["dismissed_comment"]] if isinstance(obj.get("dismissed_comment"), str) else []
+        for value in obj.values():
+            values.extend(find_comments(value, depth + 1))
+        return values
+    if isinstance(obj, list):
+        return [comment for item in obj for comment in find_comments(item, depth + 1)]
+    if isinstance(obj, str) and obj[:1] in ("{", "["):
+        try:
+            return find_comments(json.loads(obj), depth + 1)
+        except ValueError:
+            return []
+    return []
+
+
+def classify_read(response, expected_hash):
+    matching = any(hashlib.sha256(value.encode()).hexdigest() == expected_hash
+                   for value in find_comments(response))
+    if matching:
+        return "returned_matching_private_comment", True
+    if "[Filtered]" in response.get("error", {}).get("message", ""):
+        return "filtered_by_gateway", False
+    if "error" in response:
+        return "other_gateway_error", False
+    return "returned_without_matching_comment", False
+
+
+def verify_null_logs(logs):
+    return all((logs / name).is_symlink() and os.readlink(logs / name) == "/dev/null"
+               for name in NULL_LOG_NAMES)
+
+
+def run():
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    token = os.environ.get("GH_TOKEN", "")
+    expected = os.environ.get("EXPECTED_SHA256", "").lower()
+    if repository != "8e88no12-creator/msrc-dexter-private-context-lab-20261018":
+        raise ProbeError("wrong_owned_repository")
+    if not token or len(expected) != 64:
+        raise ProbeError("missing_auth_or_expected_hash")
+
+    repo_status, repo_data = api_get(f"https://api.github.com/repos/{repository}", token)
+    if repo_status != 200 or not isinstance(repo_data, dict):
+        raise ProbeError("repo_visibility_preflight_failed")
+    visibility = repo_data.get("visibility")
+    if visibility != "public" or repo_data.get("private") is not False:
+        raise ProbeError("repo_visibility_not_public")
+    alert_status, alert_data = api_get(
+        f"https://api.github.com/repos/{repository}/dependabot/alerts/{ALERT_NUMBER}", token)
+    if alert_status != 200 or not isinstance(alert_data, dict):
+        raise ProbeError("alert_preflight_failed")
+    comment = alert_data.get("dismissed_comment")
+    if not isinstance(comment, str) or hashlib.sha256(comment.encode()).hexdigest() != expected:
+        raise ProbeError("alert_hash_preflight_failed")
+
+    pull_and_verify(GATEWAY_IMAGE)
+    pull_and_verify(GITHUB_MCP_IMAGE)
+
+    sink = ThreadingHTTPServer(("0.0.0.0", port()), NoopSink)
+    sink_port = sink.server_address[1]
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    try:
+        # Startup-only instance provides direct effective-policy markers before
+        # any private alert call. Its logs remain runner-private and are deleted.
+        with tempfile.TemporaryDirectory(prefix="msrc-gateway-startup-", dir=os.environ.get("RUNNER_TEMP")) as directory:
+            logs = Path(directory)
+            process, name, _, _ = start_gateway(repository, token, sink_port, logs, "startup")
+            try:
+                markers = startup_markers(logs)
+            finally:
+                stop_gateway(process, name)
+        if not all((markers["wasm_guard_loaded"], markers["force_public_repos"], markers["public_sink_guard"])):
+            raise ProbeError("effective_public_guard_unconfirmed")
+        if markers["force_public_fail_open"]:
+            raise ProbeError("visibility_lookup_failed_open")
+
+        # Sensitive instance: every content-bearing gateway log is /dev/null.
+        with tempfile.TemporaryDirectory(prefix="msrc-gateway-null-", dir=os.environ.get("RUNNER_TEMP")) as directory:
+            logs = Path(directory)
+            for filename in NULL_LOG_NAMES:
+                (logs / filename).symlink_to("/dev/null")
+            process, name, host_port, agent_id = start_gateway(repository, token, sink_port, logs, "read")
+            try:
+                if not verify_null_logs(logs):
+                    raise ProbeError("null_log_guard_before_read_failed")
+                status, session, initialized = rpc(host_port, agent_id, None, "initialize",
+                    {"protocolVersion": "2024-11-05", "capabilities": {},
+                     "clientInfo": {"name": "owned-lab-read-probe", "version": "1.0"}}, 1)
+                if status != 200 or "result" not in initialized:
+                    raise ProbeError("gateway_initialize_failed")
+                rpc(host_port, agent_id, session, "notifications/initialized")
+                _, session, listed = rpc(host_port, agent_id, session, "tools/list", {}, 2)
+                names = [tool.get("name", "") for tool in listed.get("result", {}).get("tools", [])]
+                get_tool = next((name for name in names if name.endswith("get_dependabot_alert")), None)
+                list_tool = next((name for name in names if name.endswith("list_dependabot_alerts")), None)
+                if get_tool is None or list_tool is None:
+                    raise ProbeError("dependabot_tools_missing")
+                get_http, session, get_response = rpc(host_port, agent_id, session, "tools/call",
+                    {"name": get_tool, "arguments": {
+                        "owner": repository.split("/", 1)[0],
+                        "repo": repository.split("/", 1)[1],
+                        "alertNumber": ALERT_NUMBER,
+                    }}, 3)
+                get_category, get_hash_match = classify_read(get_response, expected)
+                list_http, session, list_response = rpc(host_port, agent_id, session, "tools/call",
+                    {"name": list_tool, "arguments": {
+                        "owner": repository.split("/", 1)[0],
+                        "repo": repository.split("/", 1)[1],
+                        "state": "dismissed",
+                    }}, 4)
+                list_category, list_hash_match = classify_read(list_response, expected)
+                if not verify_null_logs(logs):
+                    raise ProbeError("null_log_guard_after_read_failed")
+                # Scan only regular scratch files. Symlinks point to /dev/null;
+                # no log or full response is copied to Actions output/artifacts.
+                scratch_contains_comment = any(
+                    comment.encode() in path.read_bytes()
+                    for path in logs.rglob("*") if path.is_file() and not path.is_symlink()
+                )
+                if scratch_contains_comment:
+                    raise ProbeError("private_comment_in_scratch_log")
+            finally:
+                stop_gateway(process, name)
+    finally:
+        sink.shutdown()
+
+    receipt = {
+        "kind": "owned_lab_gateway_read_only",
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "source_sha": os.environ.get("GITHUB_SHA"),
+        "gateway_image_digest": GATEWAY_IMAGE.split("@", 1)[1],
+        "github_mcp_image_digest": GITHUB_MCP_IMAGE.split("@", 1)[1],
+        "repo_visibility_http": repo_status,
+        "repo_visibility": visibility,
+        "alert_http": alert_status,
+        "direct_alert_hash_match": True,
+        "gateway_wasm_loaded": markers["wasm_guard_loaded"],
+        "startup_instance_force_public_repos": markers["force_public_repos"],
+        "public_sink_guard_configured": markers["public_sink_guard"],
+        "gateway_get_http": get_http,
+        "gateway_get_category": get_category,
+        "gateway_get_comment_hash_match": get_hash_match,
+        "gateway_list_http": list_http,
+        "gateway_list_category": list_category,
+        "gateway_list_comment_hash_match": list_hash_match,
+        "mock_sink_tool_calls": NoopSink.tool_calls,
+        "no_artifact_upload_step": True,
+    }
+    print("MSRC_GATEWAY_READ_RECEIPT " + json.dumps(receipt, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except ProbeError as exc:
+        print("MSRC_GATEWAY_READ_FAILURE " + exc.category, flush=True)
+        sys.exit(1)
+    except Exception as exc:
+        # Never print exception values: HTTP, Docker, or MCP errors may contain
+        # credential-bearing headers or the private alert response.
+        print("MSRC_GATEWAY_READ_FAILURE unexpected_" + type(exc).__name__, flush=True)
+        sys.exit(1)
