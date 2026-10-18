@@ -1,0 +1,39 @@
+name: MSRC Dependabot private-context preflight
+on:
+  workflow_dispatch:
+    inputs:
+      alert_number:
+        description: Dependabot alert number containing the synthetic canary
+        required: true
+        type: string
+permissions:
+  contents: read
+  vulnerability-alerts: read
+  security-events: read
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify private alert canary hash without printing it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ALERT_NUMBER: ${{ inputs.alert_number }}
+          EXPECTED_SHA256: ${{ vars.MSRC_ALERT_CANARY_SHA256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "${EXPECTED_SHA256}"
+          response="$(gh api -H 'Accept: application/vnd.github+json' "/repos/${REPOSITORY}/dependabot/alerts/${ALERT_NUMBER}")"
+          comment="$(jq -r '.dismissed_comment // ""' <<<"${response}")"
+          actual="$(printf '%s' "${comment}" | sha256sum | awk '{print $1}')"
+          test "${actual}" = "${EXPECTED_SHA256}"
+          printf '%s\n' '{"workflow_token_alert_read":true,"canary_hash_match":true,"raw_canary_saved":false}' > preflight-receipt.json
+          echo PRIVATE_ALERT_PREFLIGHT_PASS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msrc-dependabot-private-context-preflight
+          path: preflight-receipt.json
+          if-no-files-found: error
+          retention-days: 7
