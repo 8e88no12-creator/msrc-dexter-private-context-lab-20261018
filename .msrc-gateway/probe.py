@@ -298,6 +298,8 @@ def startup_markers(logs):
 
 
 def parse_rpc(body):
+    if not body.strip():
+        return {}
     text = body.decode(errors="replace")
     if "data:" in text:
         lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
@@ -328,7 +330,7 @@ def rpc(host_port, agent_id, session, method, params=None, request_id=None):
         except ValueError:
             return exc.code, session, {}
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        raise ProbeError("gateway_rpc_transport_failed") from None
+        raise ProbeError("gateway_rpc_transport_failed_at_" + CURRENT_STAGE) from None
 
 
 def find_comments(obj, depth=0):
