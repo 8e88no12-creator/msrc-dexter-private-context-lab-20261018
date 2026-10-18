@@ -1,0 +1,31 @@
+name: MSRC repository visibility preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  visibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query repository visibility with this workflow's GITHUB_TOKEN
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.request('GET /repos/{owner}/{repo}', {
+              owner,
+              repo,
+            });
+            const receipt = {
+              endpoint: 'GET /repos/{owner}/{repo}',
+              authenticated_by: 'workflow GITHUB_TOKEN',
+              status: response.status,
+              full_name: response.data.full_name,
+              visibility: response.data.visibility,
+              private: response.data.private,
+            };
+            core.info(`VISIBILITY_RECEIPT ${JSON.stringify(receipt)}`);
+            if (response.status !== 200 || response.data.visibility !== 'public' || response.data.private !== false) {
+              core.setFailed('Expected public visibility from the workflow token');
+            }
