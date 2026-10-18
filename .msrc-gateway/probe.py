@@ -29,6 +29,7 @@ GITHUB_MCP_IMAGE = (
     "ghcr.io/github/github-mcp-server:v1.12.2@"
     "sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6"
 )
+GITHUB_MCP_RUNTIME_IMAGE = "ghcr.io/github/github-mcp-server:v1.12.2"
 ALERT_NUMBER = 5
 NULL_LOG_NAMES = (
     "mcp-gateway.log", "rpc-messages.jsonl", "gateway.md",
@@ -87,6 +88,25 @@ def pull_and_verify(image):
         raise ProbeError("image_digest_mismatch")
 
 
+def image_id(image):
+    inspect = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                             capture_output=True, text=True, timeout=20, check=False)
+    if inspect.returncode or not inspect.stdout.strip().startswith("sha256:"):
+        raise ProbeError("image_id_inspect_failed")
+    return inspect.stdout.strip()
+
+
+def pin_local_mcp_tag():
+    # The pinned v0.4.25 config schema accepts a tag but rejects @sha256 in
+    # mcpServers.github.container. Bind the schema-compatible tag to the exact
+    # verified digest on this isolated runner before launching the gateway.
+    tagged = subprocess.run(["docker", "tag", GITHUB_MCP_IMAGE, GITHUB_MCP_RUNTIME_IMAGE],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=20, check=False)
+    if tagged.returncode or image_id(GITHUB_MCP_IMAGE) != image_id(GITHUB_MCP_RUNTIME_IMAGE):
+        raise ProbeError("github_mcp_tag_pin_failed")
+
+
 class NoopSink(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     tool_calls = 0
@@ -136,7 +156,7 @@ def config(agent_id, sink_port):
     return {
         "mcpServers": {
             "github": {
-                "type": "stdio", "container": GITHUB_MCP_IMAGE,
+                "type": "stdio", "container": GITHUB_MCP_RUNTIME_IMAGE,
                 "env": {
                     "GITHUB_FEATURES": "fields_param",
                     "GITHUB_HOST": "${GITHUB_SERVER_URL}",
@@ -172,8 +192,10 @@ def startup_exit_category(logs, returncode):
             parts.append(path.read_bytes()[:1048576].lower())
     output = b"\n".join(parts)
     patterns = (
+        (b"configuration validation error", "config_schema_validation"),
+        (b"environment validation failed", "environment_validation"),
+        (b"environment validation passed", "after_environment_validation"),
         (b"unknown flag", "unknown_flag"),
-        (b"validation", "validation"),
         (b"invalid config", "invalid_config"),
         (b"permission denied", "permission_denied"),
         (b"cannot connect to the docker daemon", "docker_unavailable"),
@@ -374,6 +396,8 @@ def run():
     pull_and_verify(GATEWAY_IMAGE)
     CURRENT_STAGE = "github_mcp_image_pull"
     pull_and_verify(GITHUB_MCP_IMAGE)
+    CURRENT_STAGE = "github_mcp_tag_pin"
+    pin_local_mcp_tag()
 
     sink = ThreadingHTTPServer(("0.0.0.0", port()), NoopSink)
     sink_port = sink.server_address[1]
@@ -449,12 +473,16 @@ def run():
     finally:
         sink.shutdown()
 
+    tag_match_after_read = image_id(GITHUB_MCP_IMAGE) == image_id(GITHUB_MCP_RUNTIME_IMAGE)
+    if not tag_match_after_read:
+        raise ProbeError("github_mcp_tag_drift")
     receipt = {
         "kind": "owned_lab_gateway_read_only",
         "run_id": os.environ.get("GITHUB_RUN_ID"),
         "source_sha": os.environ.get("GITHUB_SHA"),
         "gateway_image_digest": GATEWAY_IMAGE.split("@", 1)[1],
         "github_mcp_image_digest": GITHUB_MCP_IMAGE.split("@", 1)[1],
+        "github_mcp_tag_match_after_read": tag_match_after_read,
         "repo_visibility_http": repo_status,
         "repo_visibility": visibility,
         "alert_http": alert_status,
