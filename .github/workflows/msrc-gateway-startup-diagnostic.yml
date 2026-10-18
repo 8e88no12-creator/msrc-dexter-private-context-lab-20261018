@@ -1,0 +1,27 @@
+name: MSRC gateway startup diagnostic with dummy token
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone exact public owned-lab commit without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          env -u GITHUB_TOKEN -u GH_TOKEN -u GIT_ASKPASS GIT_TERMINAL_PROMPT=0 \
+            git -c credential.helper= clone --quiet --depth 1 --branch main \
+            https://github.com/8e88no12-creator/msrc-dexter-private-context-lab-20261018.git .
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Diagnose pinned gateway startup without alert or live token
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          env -u GITHUB_TOKEN -u GH_TOKEN python3 .msrc-gateway/startup_diagnostic.py
