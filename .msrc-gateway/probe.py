@@ -158,8 +158,35 @@ def config(agent_id, sink_port):
                 }},
             },
         },
-        "gateway": {"port": 3000, "domain": "localhost", "agentId": agent_id},
+        "gateway": {"port": 8080, "domain": "awmg-mcpg", "agentId": agent_id},
     }
+
+
+def startup_exit_category(logs, returncode):
+    # Startup instance has not called an alert tool. Inspect output in memory;
+    # emit only a fixed category, never process text or config values.
+    parts = []
+    for filename in ("startup-process-output.bin", "mcp-gateway.log"):
+        path = logs / filename
+        if path.is_file() and not path.is_symlink():
+            parts.append(path.read_bytes()[:1048576].lower())
+    output = b"\n".join(parts)
+    patterns = (
+        (b"unknown flag", "unknown_flag"),
+        (b"validation", "validation"),
+        (b"invalid config", "invalid_config"),
+        (b"permission denied", "permission_denied"),
+        (b"cannot connect to the docker daemon", "docker_unavailable"),
+        (b"no such host", "dns_failure"),
+        (b"connection refused", "upstream_refused"),
+        (b"failed to start", "start_failure"),
+    )
+    for needle, category in patterns:
+        if needle in output:
+            return "gateway_exit_" + category
+    if isinstance(returncode, int):
+        return "gateway_exit_code_" + str(abs(returncode))
+    return "gateway_exited_before_health"
 
 
 def start_gateway(repository, token, sink_port, logs, label):
@@ -170,21 +197,30 @@ def start_gateway(repository, token, sink_port, logs, label):
     env["GITHUB_TOKEN"] = token
     env["GITHUB_REPOSITORY"] = repository
     env["GITHUB_SERVER_URL"] = "https://github.com"
+    payloads = logs / "payloads"
+    payloads.mkdir(exist_ok=True)
     command = [
         "docker", "run", "--rm", "-i", "--name", name,
         "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
-        "-p", f"127.0.0.1:{host_port}:3000",
+        "-p", f"127.0.0.1:{host_port}:8080",
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "-v", f"{logs}:/tmp/gh-aw/mcp-logs:rw",
+        "-v", f"{payloads}:/tmp/gh-aw/mcp-payloads:rw",
         "-e", "GITHUB_TOKEN", "-e", "GITHUB_REPOSITORY", "-e", "GITHUB_SERVER_URL",
-        "-e", "MCP_GATEWAY_PORT=3000", "-e", "MCP_GATEWAY_DOMAIN=localhost",
+        "-e", "MCP_GATEWAY_PORT=8080", "-e", "MCP_GATEWAY_DOMAIN=awmg-mcpg",
         "-e", f"MCP_GATEWAY_AGENT_ID={agent_id}",
-        "-e", "MCP_GATEWAY_MODE=--unified",
+        "-e", "MCP_GATEWAY_PAYLOAD_DIR=/tmp/gh-aw/mcp-payloads",
+        "-e", "MCP_GATEWAY_PAYLOAD_SIZE_THRESHOLD=524288",
         "-e", "MCP_GATEWAY_LOG_DIR=/tmp/gh-aw/mcp-logs",
-        GATEWAY_IMAGE, "--payload-size-threshold", "104857600",
+        GATEWAY_IMAGE,
     ]
-    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stream = (logs / "startup-process-output.bin").open("wb") if label == "startup" else subprocess.DEVNULL
+    try:
+        process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                                   stdout=stream, stderr=stream)
+    finally:
+        if stream is not subprocess.DEVNULL:
+            stream.close()
     try:
         process.stdin.write(json.dumps(config(agent_id, sink_port)).encode())
         process.stdin.close()
@@ -195,7 +231,9 @@ def start_gateway(repository, token, sink_port, logs, label):
     while time.monotonic() < deadline:
         if process.poll() is not None:
             stop_gateway(process, name)
-            raise ProbeError("gateway_exited_before_health")
+            if label == "startup":
+                raise ProbeError(startup_exit_category(logs, process.returncode))
+            raise ProbeError("read_gateway_exited_before_health")
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{host_port}/health", timeout=2) as response:
                 if response.status == 200:
@@ -257,7 +295,7 @@ def rpc(host_port, agent_id, session, method, params=None, request_id=None):
                "Authorization": agent_id}
     if session:
         headers["Mcp-Session-Id"] = session
-    request = urllib.request.Request(f"http://127.0.0.1:{host_port}/mcp",
+    request = urllib.request.Request(f"http://127.0.0.1:{host_port}/mcp/github",
                                      data=json.dumps(obj).encode(), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=35) as response:
