@@ -17,31 +17,63 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+# Pinned in Azure/azure-sdk-for-js .github/workflows/dexter.lock.yml at
+# 97674b9ddac19df7fd27abbfdbf463ccf75b0cc9 (2026-10-24 read-only audit).
+UPSTREAM_WORKFLOW_COMMIT = "97674b9ddac19df7fd27abbfdbf463ccf75b0cc9"
 GATEWAY_IMAGE = (
-    "ghcr.io/github/gh-aw-mcpg:v0.4.25@"
-    "sha256:9be0a86220e807a0ecc89e53d7453468f7a53fbc6b3d1efd2299025ffe01d086"
+    "ghcr.io/github/gh-aw-mcpg:v0.4.36@"
+    "sha256:b4d2856018959c798b3e3f81ae4ab5b275e06354e123e1f7971de931f2f450f2"
 )
 GITHUB_MCP_IMAGE = (
-    "ghcr.io/github/github-mcp-server:v1.12.2@"
-    "sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6"
+    "ghcr.io/github/github-mcp-server:v2.0.2@"
+    "sha256:ffced0d76e77428532a2ced185516992d77fd146d69eec2f244e6237d1a97796"
 )
-GITHUB_MCP_RUNTIME_IMAGE = "ghcr.io/github/github-mcp-server:v1.12.2"
+GITHUB_MCP_RUNTIME_IMAGE = "ghcr.io/github/github-mcp-server:v2.0.2"
 ALERT_NUMBER = 5
 NULL_LOG_NAMES = (
     "mcp-gateway.log", "rpc-messages.jsonl", "gateway.md",
     "github.log", "safeoutputs.log",
 )
 CURRENT_STAGE = "entry"
+API_ORIGIN = "https://api.github.com"
 
 
 class ProbeError(Exception):
     def __init__(self, category):
         super().__init__(category)
         self.category = category
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        return None
+
+
+def exact_api_origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme == "https" and parsed.netloc == "api.github.com"
+            and not parsed.fragment)
+
+
+def transport_self_check():
+    allowed = "https://api.github.com/repos/owned/lab"
+    blocked = (
+        "http://api.github.com/repos/owned/lab",
+        "https://api.github.com.evil.invalid/repos/owned/lab",
+        "https://api.github.com@evil.invalid/repos/owned/lab",
+        "https://api.github.com:443/repos/owned/lab",
+        "https://api.github.com/repos/owned/lab#fragment",
+    )
+    if (not exact_api_origin(allowed) or any(exact_api_origin(url) for url in blocked)
+            or NoRedirect().redirect_request(None, None, 302, "Found", {},
+                                               "https://evil.invalid/") is not None):
+        raise ProbeError("transport_self_check_failed")
+    print("MSRC_PROBE_TRANSPORT_SELF_CHECK_PASS", flush=True)
 
 
 def port():
@@ -51,17 +83,22 @@ def port():
 
 
 def api_get(url, token):
+    if not exact_api_origin(url):
+        raise ProbeError("api_origin_invalid")
     request = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "msrc-owned-lab-gateway-probe",
     })
+    opener = urllib.request.build_opener(NoRedirect())
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with opener.open(request, timeout=20) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise ProbeError("api_redirect_blocked") from None
             return exc.code, None
         except (urllib.error.URLError, ValueError, OSError):
             if attempt < 2:
@@ -97,9 +134,8 @@ def image_id(image):
 
 
 def pin_local_mcp_tag():
-    # The pinned v0.4.25 config schema accepts a tag but rejects @sha256 in
-    # mcpServers.github.container. Bind the schema-compatible tag to the exact
-    # verified digest on this isolated runner before launching the gateway.
+    # The gateway config uses a tagged image in mcpServers.github.container.
+    # Bind that tag to the exact digest-verified image on this isolated runner.
     tagged = subprocess.run(["docker", "tag", GITHUB_MCP_IMAGE, GITHUB_MCP_RUNTIME_IMAGE],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             timeout=20, check=False)
@@ -321,10 +357,13 @@ def rpc(host_port, agent_id, session, method, params=None, request_id=None):
         headers["Mcp-Session-Id"] = session
     request = urllib.request.Request(f"http://127.0.0.1:{host_port}/mcp/github",
                                      data=json.dumps(obj).encode(), headers=headers)
+    opener = urllib.request.build_opener(NoRedirect())
     try:
-        with urllib.request.urlopen(request, timeout=35) as response:
+        with opener.open(request, timeout=35) as response:
             return response.status, response.headers.get("Mcp-Session-Id", session), parse_rpc(response.read())
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise ProbeError("gateway_rpc_redirect_blocked") from None
         try:
             return exc.code, session, parse_rpc(exc.read())
         except ValueError:
@@ -558,6 +597,7 @@ def run():
         "kind": "owned_lab_gateway_read_only",
         "run_id": os.environ.get("GITHUB_RUN_ID"),
         "source_sha": os.environ.get("GITHUB_SHA"),
+        "upstream_workflow_commit": UPSTREAM_WORKFLOW_COMMIT,
         "gateway_image_digest": GATEWAY_IMAGE.split("@", 1)[1],
         "github_mcp_image_digest": GITHUB_MCP_IMAGE.split("@", 1)[1],
         "github_mcp_tag_match_after_read": tag_match_after_read,
@@ -587,7 +627,12 @@ def run():
 
 if __name__ == "__main__":
     try:
-        run()
+        if sys.argv[1:] == ["--self-check"]:
+            transport_self_check()
+        elif sys.argv[1:]:
+            raise ProbeError("unknown_arguments")
+        else:
+            run()
     except ProbeError as exc:
         print("MSRC_GATEWAY_READ_FAILURE " + exc.category, flush=True)
         sys.exit(1)

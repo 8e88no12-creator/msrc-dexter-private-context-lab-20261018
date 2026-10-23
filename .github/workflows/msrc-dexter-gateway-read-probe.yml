@@ -1,4 +1,4 @@
-name: MSRC Dexter pinned gateway private-alert read probe
+name: MSRC Dexter current-pinned gateway private-alert read probe
 
 on:
   workflow_dispatch:
